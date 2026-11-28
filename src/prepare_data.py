@@ -1,202 +1,204 @@
-"""Prepare Challenge 2021 ECG records for multilabel classification.
+"""Build beat-by-beat AAMI data for the Holter model.
 
-Records are discovered recursively from the PhysioNet Challenge training
-directory. Each .hea/.mat pair becomes one example; ``# Dx`` header codes are
-the multilabel targets. Signals are resampled to a fixed length for batching.
+Recursively discovers WFDB records with beat annotations. Challenge 2021
+records without beat annotations are reported and skipped: their record-level
+Dx codes cannot be used as labels for individual beats.
 """
 import argparse
 import json
 import os
-import sys
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import zlib
 
 import numpy as np
 import wfdb
-from sklearn.model_selection import train_test_split
+from scipy.signal import resample_poly
+from sklearn.model_selection import GroupShuffleSplit
 
-try:
-    sys.stdout.reconfigure(errors="replace")
-except (AttributeError, ValueError):
-    pass
-
-DEFAULT_DATA = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), "../../../../project/Dataset/physionet.org/files/challenge-2021/1.0.3/training"
-))
-DEFAULT_OUTPUT = os.path.join(os.path.dirname(__file__), "dataset")
-TARGET_LENGTH = 5000
-TARGET_LEADS = 12
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LEARN = os.path.abspath(os.path.join(HERE, "../LearnDataset"))
+DEFAULT_CHALLENGE = os.path.abspath(os.path.join(
+    HERE, "../../../../Dataset/physionet.org/files/challenge-2021/1.0.3/training"))
+DEFAULT_OUT = os.path.join(HERE, "dataset")
+FS_TARGET, BEFORE, AFTER, WINDOW = 360, 90, 270, 360
+MAX_BEATS_PER_RECORD = 1200
 SEED = 42
+AAMI = {"N": "N", "L": "N", "R": "N", "e": "N", "j": "N",
+        "A": "S", "a": "S", "J": "S", "S": "S", "V": "V",
+        "E": "V", "F": "F"}
+CLASSES = np.array(["F", "N", "S", "V"])
 
-parser = argparse.ArgumentParser(description="Prepare Challenge 2021 ECG dataset")
-parser.add_argument("--data", default=DEFAULT_DATA, help="Challenge 2021 training directory")
-parser.add_argument("--out", default=DEFAULT_OUTPUT, help="output directory")
-parser.add_argument("--length", type=int, default=TARGET_LENGTH,
-                    help="samples per record after resampling (default: 5000)")
-parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1),
-                    help="parallel record readers (default: up to 4)")
+parser = argparse.ArgumentParser(description="Prepare annotated ECG beats for Holter AAMI classification")
+parser.add_argument("--data", default=DEFAULT_LEARN, help="annotated WFDB dataset root")
+parser.add_argument("--challenge-data", default=DEFAULT_CHALLENGE,
+                    help="optional Challenge 2021 root; records without beat annotations are skipped")
+parser.add_argument("--out", default=DEFAULT_OUT, help="prepared dataset output directory")
+parser.add_argument("--max-beats-per-record", type=int, default=MAX_BEATS_PER_RECORD,
+                    help="reproducible per-record cap; use 0 for no cap")
+parser.add_argument("--balance", choices=("median", "max", "none"), default="max",
+                    help="balance only the training fit split to the largest class (default), median class size, or none")
 args = parser.parse_args()
-if args.workers < 1:
-    parser.error("--workers must be at least 1")
 
 
-def discover_records(root):
-    """Return sorted record paths whose header and referenced signal exist."""
-    result = []
+def discover(root):
+    """Find complete WFDB records having an .atr annotation file."""
+    if not root or not os.path.isdir(root):
+        return []
+    found = []
     for directory, _, files in os.walk(root):
-        for name in files:
-            if not name.lower().endswith(".hea"):
+        for header_name in files:
+            if not header_name.lower().endswith(".hea"):
                 continue
-            path = os.path.join(directory, os.path.splitext(name)[0])
-            try:
-                header = wfdb.rdheader(path)
-            except Exception:
-                continue
-            if header.n_sig and all(os.path.isfile(os.path.join(directory, f))
-                                    for f in header.file_name):
-                result.append(path)
-    return sorted(result)
+            base = os.path.splitext(header_name)[0]
+            record = os.path.join(directory, base)
+            if os.path.isfile(record + ".atr"):
+                found.append(record)
+    return sorted(set(found))
 
 
-def diagnosis_codes(comments):
-    codes = []
-    for line in comments or []:
-        key, sep, value = line.partition(":")
-        if sep and key.strip().lower() == "dx":
-            codes.extend(x.strip() for x in value.split(",") if x.strip())
-    return sorted(set(codes))
-
-
-def resize_signal(signal, length):
-    """Linearly resample time and normalize to a consistent 12-lead input."""
+def choose_leads(signal, sig_names):
+    """Select Lead II/MLII and V1 where present; duplicate a mono lead."""
     signal = np.asarray(signal, dtype=np.float32)
     if signal.ndim == 1:
         signal = signal[:, None]
-    if not np.isfinite(signal).all():
-        signal = np.nan_to_num(signal, copy=False)
-    old_x = np.linspace(0.0, 1.0, signal.shape[0], dtype=np.float32)
-    new_x = np.linspace(0.0, 1.0, length, dtype=np.float32)
-    resized = np.stack([np.interp(new_x, old_x, signal[:, lead])
-                        for lead in range(signal.shape[1])], axis=-1)
-    if resized.shape[1] < TARGET_LEADS:
-        resized = np.pad(resized, ((0, 0), (0, TARGET_LEADS - resized.shape[1])))
-    else:
-        resized = resized[:, :TARGET_LEADS]
-    mean = resized.mean(axis=0, keepdims=True)
-    std = resized.std(axis=0, keepdims=True)
-    return ((resized - mean) / np.maximum(std, 1e-6)).astype(np.float32)
+    names = [str(n).strip().upper().replace(" ", "") for n in (sig_names or [])]
+    def find(candidates):
+        return next((i for i, name in enumerate(names) if name in candidates), None)
+    lead_ii = find({"II", "MLII", "MCL1"})
+    lead_v1 = find({"V1", "ECG V1"})
+    if lead_ii is None:
+        lead_ii = 0
+    if lead_v1 is None:
+        lead_v1 = next((i for i in range(signal.shape[1]) if i != lead_ii), lead_ii)
+    return signal[:, [lead_ii, lead_v1]]
 
 
-def prepare_record(index_path):
-    """Read and resize one ECG; return a compact failure reason on errors."""
-    index, path = index_path
+def normalize_beat(beat):
+    if not np.isfinite(beat).all():
+        return None
+    mean = beat.mean(axis=0, keepdims=True)
+    std = beat.std(axis=0, keepdims=True)
+    if np.any(std < 1e-6):
+        return None
+    return ((beat - mean) / (std + 1e-8)).astype(np.float32)
+
+
+roots = [os.path.abspath(args.data)]
+if args.challenge_data and os.path.abspath(args.challenge_data) not in roots:
+    roots.append(os.path.abspath(args.challenge_data))
+records = []
+for root in roots:
+    if not os.path.isdir(root):
+        print(f"Warning: data root not found, skipping: {root}")
+        continue
+    discovered = discover(root)
+    records.extend((record, root) for record in discovered)
+    print(f"Found {len(discovered)} beat-annotated records under {root}")
+records.sort(key=lambda item: item[0])
+if not records:
+    raise SystemExit("No WFDB records with .atr beat annotations found")
+
+X_parts, y_parts, group_parts = [], [], []
+used, skipped = [], []
+for ix, (record_path, root) in enumerate(records, 1):
+    name = os.path.relpath(record_path, root)
     try:
-        header = wfdb.rdheader(path)
-        codes = diagnosis_codes(header.comments)
-        if not codes:
-            return index, None, None, "no Dx labels"
-        signal = wfdb.rdrecord(path, physical=True).p_signal
-        if signal is None or len(signal) < 2:
-            raise ValueError("empty signal")
-        return index, codes, resize_signal(signal, args.length), None
+        header = wfdb.rdheader(record_path)
+        record = wfdb.rdrecord(record_path, physical=True)
+        annot = wfdb.rdann(record_path, "atr")
+        signal = choose_leads(record.p_signal, header.sig_name)
+        fs = float(header.fs)
+        samples = np.asarray(annot.sample, dtype=int)
+        if fs != FS_TARGET:
+            from math import gcd
+            ratio = FS_TARGET / fs
+            up, down = int(round(ratio * 10000)), 10000
+            common = gcd(up, down)
+            up, down = up // common, down // common
+            signal = resample_poly(signal, up, down, axis=0).astype(np.float32)
+            samples = np.round(samples * (FS_TARGET / fs)).astype(int)
+        symbols = np.asarray(annot.symbol)
+        valid = [(int(s), AAMI[sym]) for s, sym in zip(samples, symbols)
+                 if sym in AAMI and AAMI[sym] in CLASSES
+                 and s >= BEFORE and s + AFTER <= len(signal)]
+        if args.max_beats_per_record and len(valid) > args.max_beats_per_record:
+            rng = np.random.default_rng(SEED + zlib.crc32(name.encode()) % 1_000_000)
+            selected = sorted(rng.choice(len(valid), args.max_beats_per_record, replace=False))
+            valid = [valid[j] for j in selected]
+        beats, labels = [], []
+        for peak, label in valid:
+            beat = normalize_beat(signal[peak - BEFORE:peak + AFTER])
+            if beat is not None:
+                beats.append(beat)
+                labels.append(label)
+        if beats:
+            X_parts.append(np.stack(beats))
+            y_parts.append(np.asarray(labels))
+            group_parts.extend([name] * len(beats))
+            used.append({"record": name, "beats": len(beats), "source_fs": fs})
     except Exception as exc:
-        return index, None, None, f"{type(exc).__name__}: {exc}"
+        skipped.append({"record": name, "reason": f"{type(exc).__name__}: {exc}"})
+    if ix % 100 == 0 or ix == len(records):
+        print(f"Processed {ix}/{len(records)} annotated records")
 
+if not X_parts:
+    raise SystemExit("Beat annotation files were found, but no usable beats were extracted")
+X = np.concatenate(X_parts)
+labels = np.concatenate(y_parts)
+groups = np.asarray(group_parts)
+y = np.searchsorted(CLASSES, labels).astype(np.int64)
+if len(np.unique(groups)) < 2:
+    raise SystemExit("At least two usable records are required for a record-level train/test split")
+splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+train_idx, test_idx = next(splitter.split(X, y, groups))
+# Make a record-level validation split before any resampling. This keeps all
+# beats from each record together and prevents oversampled copies leaking into
+# validation or test data.
+val_splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED + 1)
+fit_rel, val_rel = next(val_splitter.split(X[train_idx], y[train_idx], groups[train_idx]))
+fit_idx, val_idx = train_idx[fit_rel], train_idx[val_rel]
 
-if not os.path.isdir(args.data):
-    raise SystemExit(f"Dataset directory not found: {args.data}")
-record_paths = discover_records(args.data)
-if not record_paths:
-    raise SystemExit(f"No readable .hea/.mat records found under {args.data}")
-print(f"Discovered {len(record_paths)} records under {args.data}")
+fit_counts = np.bincount(y[fit_idx], minlength=len(CLASSES))
+present_counts = fit_counts[fit_counts > 0]
+if len(present_counts) != len(CLASSES):
+    missing = CLASSES[fit_counts == 0].tolist()
+    raise SystemExit(f"Training fit split is missing classes {missing}; use more annotated records or change the split seed.")
+if args.balance == "median":
+    target_count = int(np.median(present_counts))
+elif args.balance == "max":
+    target_count = int(present_counts.max())
+else:
+    target_count = None
+
+if target_count is not None:
+    rng = np.random.default_rng(SEED)
+    sampled_parts = []
+    for label in range(len(CLASSES)):
+        class_idx = fit_idx[y[fit_idx] == label]
+        replace = len(class_idx) < target_count
+        chosen = rng.choice(class_idx, size=target_count, replace=replace)
+        sampled_parts.append(chosen)
+    fit_idx = np.concatenate(sampled_parts)
+    rng.shuffle(fit_idx)
 
 os.makedirs(args.out, exist_ok=True)
-# Keep the large signal matrix on disk. Building a Python list and then calling
-# np.stack duplicates the full dataset in RAM, which can take down VS Code.
-signals_path = os.path.join(args.out, ".signals.tmp.npy")
-signals = None
-successful = {}
-skipped = []
-signals = np.lib.format.open_memmap(
-    signals_path, mode="w+", dtype=np.float32,
-    shape=(len(record_paths), args.length, TARGET_LEADS))
-
-# Keep only a small number of futures in flight. Each completed result contains
-# one resized ECG, so unbounded submission could otherwise consume substantial RAM.
-items = iter(enumerate(record_paths))
-completed_count = 0
-with ThreadPoolExecutor(max_workers=args.workers) as executor:
-    pending = set()
-    for _ in range(min(len(record_paths), args.workers * 2)):
-        index_path = next(items, None)
-        if index_path is not None:
-            pending.add(executor.submit(prepare_record, index_path))
-    while pending:
-        done, pending = wait(pending, return_when=FIRST_COMPLETED)
-        for future in done:
-            index, codes, resized, reason = future.result()
-            path = record_paths[index]
-            if reason is not None:
-                skipped.append({"record": os.path.relpath(path, args.data), "reason": reason})
-            else:
-                signals[index] = resized
-                successful[index] = codes
-            completed_count += 1
-            if completed_count % 1000 == 0 or completed_count == len(record_paths):
-                print(f"  Processed {completed_count}/{len(record_paths)}")
-        for _ in range(len(done)):
-            index_path = next(items, None)
-            if index_path is not None:
-                pending.add(executor.submit(prepare_record, index_path))
-
-labels = [successful[i] for i in sorted(successful)]
-record_names = [os.path.relpath(record_paths[i], args.data) for i in sorted(successful)]
-successful_indices = np.asarray(sorted(successful), dtype=np.int64)
-
-if len(labels) < 2:
-    raise SystemExit("Fewer than two labeled records could be read")
-classes = np.asarray(sorted({code for row in labels for code in row}))
-class_index = {code: i for i, code in enumerate(classes)}
-y = np.zeros((len(labels), len(classes)), dtype=np.float32)
-for row, codes in enumerate(labels):
-    y[row, [class_index[c] for c in codes]] = 1.0
-
-# Split records once. Stratification is unsuitable for multilabel targets;
-# seeded shuffle gives a reproducible record-level split without leakage.
-indices = np.arange(len(labels))
-train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=SEED, shuffle=True)
-signals.flush()
-del signals
-signals = np.load(signals_path, mmap_mode="r")
-
-def save_signal_split(filename, split_indices):
-    destination = os.path.join(args.out, filename)
-    output = np.lib.format.open_memmap(
-        destination, mode="w+", dtype=np.float32,
-        shape=(len(split_indices), args.length, TARGET_LEADS))
-    batch_size = 64
-    for start in range(0, len(split_indices), batch_size):
-        batch_indices = split_indices[start:start + batch_size]
-        source_indices = successful_indices[batch_indices]
-        output[start:start + len(batch_indices)] = signals[source_indices]
-    output.flush()
-    del output
-
-save_signal_split("X_train.npy", train_idx)
-save_signal_split("X_test.npy", test_idx)
-np.save(os.path.join(args.out, "y_train.npy"), y[train_idx])
-np.save(os.path.join(args.out, "y_test.npy"), y[test_idx])
-np.save(os.path.join(args.out, "classes.npy"), classes)
-np.save(os.path.join(args.out, "records_train.npy"), np.asarray(record_names)[train_idx])
-np.save(os.path.join(args.out, "records_test.npy"), np.asarray(record_names)[test_idx])
-del signals
-os.remove(signals_path)
-meta = {"source_dir": os.path.abspath(args.data), "records_discovered": len(record_paths),
-        "records_used": len(labels), "records_skipped": skipped, "length": args.length,
-        "leads": TARGET_LEADS, "classes": classes.tolist(),
-        "train_shape": [len(train_idx), args.length, TARGET_LEADS],
-        "test_shape": [len(test_idx), args.length, TARGET_LEADS],
-        "labels_per_class": {c: int(y[:, j].sum()) for j, c in enumerate(classes)}}
+for name, arr in (("X_train", X[fit_idx]), ("X_val", X[val_idx]), ("X_test", X[test_idx]),
+                  ("y_train", y[fit_idx]), ("y_val", y[val_idx]), ("y_test", y[test_idx]),
+                  ("classes", CLASSES), ("records_train", groups[train_idx]),
+                  ("records_fit", groups[fit_idx]), ("records_val", groups[val_idx]),
+                  ("records_test", groups[test_idx])):
+    np.save(os.path.join(args.out, name + ".npy"), arr)
+summary = {"sources": roots, "records_found_with_atr": len(records),
+           "records_used": used, "records_skipped": skipped,
+           "beats_total": int(len(y)), "window_samples": WINDOW,
+           "target_fs": FS_TARGET, "leads": ["II/MLII", "V1"],
+           "classes": CLASSES.tolist(), "train_shape": list(X[train_idx].shape),
+           "fit_shape_after_rebalancing": list(X[fit_idx].shape),
+           "validation_shape": list(X[val_idx].shape), "balance": args.balance,
+           "fit_class_counts_before": {str(CLASSES[i]): int(fit_counts[i]) for i in range(len(CLASSES))},
+           "fit_class_counts_after": {str(CLASSES[i]): int((y[fit_idx] == i).sum()) for i in range(len(CLASSES))},
+           "test_shape": list(X[test_idx].shape),
+           "class_counts": {c: int((labels == c).sum()) for c in CLASSES}}
 with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
-    json.dump(meta, f, indent=2)
-print(f"Saved {len(train_idx)} train and {len(test_idx)} test records to {args.out}")
-print(f"Classes: {len(classes)} | leads: {TARGET_LEADS} | shape: ({args.length}, {TARGET_LEADS})")
+    json.dump(summary, f, indent=2)
+print(f"Saved {len(train_idx):,} train beats and {len(test_idx):,} test beats to {args.out}")
+print("Challenge 2021 records without .atr beat annotations were automatically skipped.")

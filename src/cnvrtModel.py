@@ -26,11 +26,10 @@ import tensorflow as tf
 from tf2onnx import convert
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
-MODEL_PATH = os.path.join(PROJECT_ROOT, "model", "ecg_cnn.h5")
-ONNX_PATH = os.path.join(PROJECT_ROOT, "model", "ecg_cnn.onnx")
-TEST_DATA = os.path.join(PROJECT_ROOT, "dataset", "X_test.npy")
-CLASSES_PATH = os.path.join(PROJECT_ROOT, "dataset", "classes.npy")
+MODEL_PATH = os.path.join(BASE_DIR, "model", "ecg_cnn.h5")
+ONNX_PATH = os.path.join(BASE_DIR, "model", "ecg_cnn.onnx")
+TEST_DATA = os.path.join(BASE_DIR, "dataset", "X_test.npy")
+CLASSES_PATH = os.path.join(BASE_DIR, "dataset", "classes.npy")
 
 OPSET = 13          # 13 = large compatibilité (onnxruntime, X-CUBE-AI, tf2onnx)
 WINDOW = 360

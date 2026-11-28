@@ -19,7 +19,8 @@ FORMAT CSV ATTENDU :
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from scipy.signal import resample
+import wfdb
+from scipy.signal import resample_poly
 import matplotlib.pyplot as plt
 import argparse, os
 from collections import Counter
@@ -29,7 +30,9 @@ MODEL_PATH = "model/ecg_cnn.h5"
 CLASSES_PATH = "dataset/classes.npy"
 STM32_FS = 1000  # fréquence STM32 (Hz)
 MITBIH_FS = 360  # fréquence MIT-BIH (Hz)
-WINDOW_MITBIH = 36  # fenêtre MIT-BIH après rééchantillonnage
+BEFORE_PEAK = 90
+AFTER_PEAK = 270
+WINDOW_MITBIH = BEFORE_PEAK + AFTER_PEAK
 ADC_BASELINE = 2000  # baseline ADC STM32
 
 CLASSES_FULL = {
@@ -66,25 +69,31 @@ def load_stm32_csv(csv_path):
 
 # ─── PRÉTRAITEMENT ────────────────────────────────────────────────────────────
 def preprocess_signal(signal):
-    """Centre, rééchantillonne, découpe en fenêtres."""
+    """Detect R peaks and build normalized (360, 2) beats like training data."""
+    signal = np.asarray(signal, dtype=np.float32).reshape(-1, 1) - ADC_BASELINE
+    if len(signal) < WINDOW_MITBIH:
+        raise ValueError(f"Need at least {WINDOW_MITBIH} samples at {STM32_FS} Hz")
 
-    # 1. Centrer le signal (retirer la baseline ADC)
-    signal = signal - ADC_BASELINE
+    # Polyphase resampling avoids the periodic-boundary artifacts of Fourier resample.
+    signal_360 = resample_poly(signal, MITBIH_FS, STM32_FS, axis=0).astype(np.float32)
+    # Training used Lead II and V1; for this single-lead device duplicate its lead.
+    signal_360 = np.repeat(signal_360, 2, axis=1)
+    peaks = np.asarray(wfdb.processing.xqrs_detect(
+        signal_360[:, 0], fs=MITBIH_FS, verbose=False), dtype=int)
+    peaks = peaks[(peaks >= BEFORE_PEAK) & (peaks + AFTER_PEAK <= len(signal_360))]
 
-    # 2. Rééchantillonner 1000Hz → 360Hz
-    n_samples_360 = int(len(signal) * MITBIH_FS / STM32_FS)
-    signal_360 = resample(signal, n_samples_360)
-
-    # 3. Découper en fenêtres de 360 samples (overlap 50%)
-    step = WINDOW_MITBIH // 2
-    windows = []
-    for i in range(0, len(signal_360) - WINDOW_MITBIH, step):
-        w = signal_360[i : i + WINDOW_MITBIH].astype(np.float32)
-        # Normalisation par fenêtre
-        w = (w - w.mean()) / (w.std() + 1e-8)
-        windows.append(w)
-
-    return np.array(windows)[..., np.newaxis]  # (N, 360, 1)
+    beats = []
+    for peak in peaks:
+        beat = signal_360[peak - BEFORE_PEAK:peak + AFTER_PEAK]
+        if not np.isfinite(beat).all():
+            continue
+        std = beat.std(axis=0, keepdims=True)
+        if np.any(std < 1e-6):
+            continue
+        beats.append(((beat - beat.mean(axis=0, keepdims=True)) / (std + 1e-8)).astype(np.float32))
+    if not beats:
+        return np.empty((0, WINDOW_MITBIH, 2), dtype=np.float32)
+    return np.stack(beats)
 
 
 # ─── CLASSIFICATION ───────────────────────────────────────────────────────────
@@ -103,11 +112,16 @@ def classify(csv_path):
 
     # Prétraiter
     X = preprocess_signal(signal)
-    print(f"  Fenêtres    : {len(X)} fenêtres de {WINDOW_MITBIH} samples")
+    print(f"  Battements détectés : {len(X)} ({WINDOW_MITBIH} samples × 2 leads)")
 
     # Charger modèle
     model = tf.keras.models.load_model(MODEL_PATH)
     classes = np.load(CLASSES_PATH, allow_pickle=True)
+    if tuple(model.input_shape[1:]) != (WINDOW_MITBIH, 2):
+        raise SystemExit(f"Model expects {model.input_shape[1:]}, but this classifier supplies "
+                         f"({WINDOW_MITBIH}, 2). Retrain/export the matching model first.")
+    if not len(X):
+        raise SystemExit("No usable R-centered beats detected in this recording.")
 
     # Prédire
     print(f"\n  Classification en cours...")
@@ -115,19 +129,9 @@ def classify(csv_path):
     labels = np.argmax(preds, axis=1)
     confs = np.max(preds, axis=1)
 
-    # ── Filtre par seuil de confiance (ne garde que les fenêtres fiables) ──
-    CONF_THRESHOLD = 0.60  # seuil : 60% — ajustable
-    mask = confs >= CONF_THRESHOLD
-    labels = labels[mask]
-    confs = confs[mask]
-    print(
-        f"  Fenêtres retenues (confiance ≥ {CONF_THRESHOLD * 100:.0f}%) : "
-        f"{mask.sum()}/{len(mask)} ({mask.mean() * 100:.1f}%)"
-    )
-
-    # Résultats par classe
+    # Report every detected beat; threshold filtering can hide minority predictions.
     counts = Counter(labels)
-    total = len(labels) if len(labels) > 0 else 1
+    total = len(labels)
 
     print(f"\n{'─' * 45}")
     print(f"  RÉSULTATS DE CLASSIFICATION")
@@ -151,6 +155,7 @@ def classify(csv_path):
     )
     print(f"  Présence             : {dominant_pct:.1f}% des fenêtres")
     print(f"  Confiance moyenne    : {mean_conf:.1f}%")
+    print(f"  Confiance < 60%      : {(confs < 0.60).sum()}/{len(confs)} battements")
     print(f"{'=' * 55}\n")
 
     # ─── GRAPHIQUE ────────────────────────────────────────────────────────────
